@@ -64,6 +64,7 @@ const LocalImageGalleryNode = {
                 availableSourceFolders: [], 
                 metadataFilter: "all",
                 sortOrder: "name",
+                fitMode: "crop",
                 previewSize: 110,
                 foldersRendered: false,
                 elements: {},
@@ -149,6 +150,10 @@ const LocalImageGalleryNode = {
                                 <option value="date">Date (Newest)</option>
                                 <option value="date_asc">Date (Oldest)</option>
                             </select>
+                            <select class="fit-mode-select" title="Thumbnail fit mode">
+                                <option value="crop">Crop</option>
+                                <option value="pad">Pad</option>
+                            </select>
                             <button class="refresh-btn" title="Refresh image list">🔄</button>
                         </div>
                         <div class="localimage-size-control">
@@ -178,6 +183,7 @@ const LocalImageGalleryNode = {
             els.refreshBtn = widgetContainer.querySelector(".refresh-btn");
             els.metadataSelect = widgetContainer.querySelector(".metadata-filter-select");
             els.sortSelect = widgetContainer.querySelector(".sort-order-select");
+            els.fitModeSelect = widgetContainer.querySelector(".fit-mode-select");
             els.selectedDisplay = widgetContainer.querySelector(".localimage-selected-display");
             els.controls = widgetContainer.querySelector(".localimage-controls");
             els.sizeSlider = widgetContainer.querySelector(".size-slider");
@@ -462,6 +468,7 @@ const LocalImageGalleryNode = {
                     selected_image_source: state.selectedImageSource,
                     metadata_filter: state.metadataFilter,
                     sort_order: state.sortOrder,
+                    fit_mode: state.fitMode,
                     preview_size: state.previewSize
                 });
             };
@@ -622,9 +629,16 @@ const LocalImageGalleryNode = {
                         ? img.name.split(/[/\\]/).pop() 
                         : img.name;
 
+                    // Append fit mode so the server serves crop vs pad cache
+                    let thumbSrc = img.preview_url || EMPTY_IMAGE;
+                    if (img.preview_url && state.fitMode) {
+                        const sep = img.preview_url.includes('?') ? '&' : '?';
+                        thumbSrc = `${img.preview_url}${sep}mode=${encodeURIComponent(state.fitMode)}`;
+                    }
+
                     card.innerHTML = `
                         <div class="localimage-media-container" style="height: ${imageHeight}px;">
-                            <img src="${img.preview_url || EMPTY_IMAGE}" loading="lazy" decoding="async" alt="${displayName}">
+                            <img src="${thumbSrc}" loading="lazy" decoding="async" alt="${displayName}">
                         </div>
                         <div class="localimage-image-card-info">
                             <p>${displayName}</p>
@@ -963,6 +977,24 @@ const LocalImageGalleryNode = {
                 fetchAndRender(false);
             });
 
+            els.fitModeSelect.addEventListener("change", () => {
+                state.fitMode = els.fitModeSelect.value;
+                node.setProperty("fit_mode", state.fitMode);
+                
+                // Update CSS object-fit to match mode
+                if (els.root) {
+                    els.root.dataset.fitMode = state.fitMode;
+                }
+                
+                LocalImageGalleryNode.setUiState(node.id, node.properties.image_gallery_unique_id, { 
+                    fit_mode: state.fitMode 
+                });
+                
+                // Force re-render so thumbnail URLs pick up the new mode
+                state.visibleRange = { start: 0, end: 0 };
+                renderVisibleCards();
+            });
+
             let sizeSliderTimeout;
             els.sizeSlider.addEventListener("input", (e) => {
                 const size = parseInt(e.target.value, 10);
@@ -1055,7 +1087,8 @@ const LocalImageGalleryNode = {
                     current_source_folder: "",
                     selected_image_source: "",
                     metadata_filter: "all", 
-                    sort_order: "name", 
+                    sort_order: "name",
+                    fit_mode: "crop",
                     preview_size: 110 
                 };
                 
@@ -1079,6 +1112,10 @@ const LocalImageGalleryNode = {
                 // Priority: 1. Node Properties (Paste/Save), 2. Server State (Reload), 3. Default
                 state.metadataFilter = node.properties.metadata_filter || initialState.metadata_filter || "all";
                 state.sortOrder = node.properties.sort_order || initialState.sort_order || "name";
+                state.fitMode = node.properties.fit_mode || initialState.fit_mode || "crop";
+                if (state.fitMode !== "crop" && state.fitMode !== "pad") {
+                    state.fitMode = "crop";
+                }
 
                 // Handle size carefully (parse int)
                 const propSize = node.properties.preview_size ? parseInt(node.properties.preview_size) : null;
@@ -1107,6 +1144,13 @@ const LocalImageGalleryNode = {
                 
                 els.sizeSlider.value = state.previewSize;
                 updatePreviewSize(state.previewSize);
+
+                if (els.fitModeSelect) {
+                    els.fitModeSelect.value = state.fitMode;
+                }
+                if (els.root) {
+                    els.root.dataset.fitMode = state.fitMode;
+                }
 
                 await fetchAndRender();
 
@@ -1166,6 +1210,13 @@ const LocalImageGalleryNode = {
                 
                 if (state.sortOrder) {
                     els.sortSelect.value = state.sortOrder;
+                }
+                
+                if (state.fitMode && els.fitModeSelect) {
+                    els.fitModeSelect.value = state.fitMode;
+                    if (els.root) {
+                        els.root.dataset.fitMode = state.fitMode;
+                    }
                 }
                 
             };
@@ -1398,12 +1449,19 @@ const LocalImageGalleryNode = {
                     border-color: #00FFC9; box-shadow: 0 0 10px rgba(0, 255, 201, 0.3); 
                 }
                 .localimage-root .localimage-media-container { 
-                    width: 100%; background-color: #111; 
+                    width: 100%; background-color: #000; 
                     overflow: hidden; display: flex; align-items: center; 
                     justify-content: center; flex-shrink: 0;
                 }
                 .localimage-root .localimage-media-container img { 
                     width: 100%; height: 100%; object-fit: cover;
+                }
+                /* Pad mode: show full image (thumbnails are already letterboxed with black) */
+                .localimage-root[data-fit-mode="pad"] .localimage-media-container img {
+                    object-fit: contain;
+                }
+                .localimage-root[data-fit-mode="crop"] .localimage-media-container img {
+                    object-fit: cover;
                 }
                 .localimage-root .localimage-image-card-info { 
                     padding: 4px 6px; background: #2a2a2a; flex-grow: 1;
