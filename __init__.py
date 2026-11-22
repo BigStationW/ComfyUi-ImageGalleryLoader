@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import hashlib
 import time
+import random
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -269,6 +270,8 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             all_images = sorted(all_images, key=lambda x: x['mtime'], reverse=True)
         elif sort_by == "date_asc":
             all_images = sorted(all_images, key=lambda x: x['mtime'])
+        elif sort_by == "random":
+            random.shuffle(all_images)
         else:
             all_images = sorted(all_images, key=lambda x: x['name'].lower())
         
@@ -314,6 +317,8 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
         all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0), reverse=True)
     elif sort_by == "date_asc":
         all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0))
+    elif sort_by == "random":
+        random.shuffle(all_images)
     else:
         all_images = sorted(all_images, key=lambda x: x.lower())
     
@@ -337,19 +342,33 @@ def get_thumbnail_path(image_path, mode='crop'):
     except OSError:
         mtime = 0
     
-    cache_key = hashlib.md5(f"{image_path}:{mtime}".encode()).hexdigest()
+    # v2 for pad: scale-to-fill-one-axis (allows upscaling); bump to invalidate old caches
+    key_src = f"{image_path}:{mtime}:padv2" if mode == 'pad' else f"{image_path}:{mtime}"
+    cache_key = hashlib.md5(key_src.encode()).hexdigest()
     cache_dir = CACHE_DIR_PAD if mode == 'pad' else CACHE_DIR
     return os.path.join(cache_dir, f"{cache_key}.webp")
+
+
+def _lanczos():
+    """LANCZOS filter compatible with older and newer Pillow."""
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return Image.LANCZOS
 
 
 def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 200
     """Generate and cache a thumbnail.
     
-    mode='crop': fit image inside max_size (aspect preserved); CSS may crop via object-fit:cover.
-    mode='pad': fit image inside a max_size x max_size square and pad with solid black #000000.
+    mode='crop': fit image inside max_size (aspect preserved, downscale only); CSS may crop via object-fit:cover.
+    mode='pad': scale (up or down) so image fills at least one axis of a max_size square, pad with #000000.
     """
     if mode not in ('crop', 'pad'):
         mode = 'crop'
+    
+    # Ensure the target cache directory exists (in case it was deleted at runtime)
+    cache_dir = CACHE_DIR_PAD if mode == 'pad' else CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
     
     thumb_path = get_thumbnail_path(image_path, mode)
     
@@ -359,6 +378,7 @@ def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 2
     try:
         with Image.open(image_path) as img:
             img = ImageOps.exif_transpose(img)
+            resample = _lanczos()
             
             if mode == 'pad':
                 # Convert to RGB on black background for transparency
@@ -371,8 +391,21 @@ def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 2
                 elif img.mode != 'RGB':
                     img = img.convert('RGB')
                 
-                # Fit inside max_size maintaining aspect ratio
-                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                # Scale (up or down) so the image always touches at least one pair of
+                # edges of the square. Equivalent to CSS object-fit: contain.
+                w, h = img.size
+                if w <= 0 or h <= 0:
+                    raise ValueError(f"Invalid image size {w}x{h}")
+                
+                scale = min(max_size / float(w), max_size / float(h))
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                # Clamp so we never exceed the canvas due to rounding
+                new_w = min(new_w, max_size)
+                new_h = min(new_h, max_size)
+                
+                if (new_w, new_h) != (w, h):
+                    img = img.resize((new_w, new_h), resample)
                 
                 # Pad to square with solid black #000000
                 canvas = Image.new('RGB', (max_size, max_size), (0, 0, 0))
@@ -381,7 +414,7 @@ def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 2
                 img = canvas
             else:
                 # Crop/fit mode: existing behavior (fit inside, dark gray bg for alpha)
-                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                img.thumbnail((max_size, max_size), resample)
                 
                 if img.mode in ('RGBA', 'LA', 'P'):
                     background = Image.new('RGB', img.size, (30, 30, 30))
@@ -396,7 +429,9 @@ def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 2
             img.save(thumb_path, 'WEBP', quality=92, method=4)
             return thumb_path
     except Exception as e:
-        print(f"Error generating thumbnail for {image_path}: {e}")
+        import traceback
+        print(f"Error generating thumbnail ({mode}) for {image_path}: {e}")
+        print(traceback.format_exc())
         return None
 
 def load_source_folders():
@@ -822,7 +857,7 @@ async def get_images_endpoint(request):
         if metadata_filter not in ['all', 'with', 'without']:
             metadata_filter = 'all'
         
-        if sort_by not in ['name', 'date', 'date_asc']:
+        if sort_by not in ['name', 'date', 'date_asc', 'random']:
             sort_by = 'name'
         
         if source_folder:
