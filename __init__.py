@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import hashlib
 import time
+import random
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -26,13 +27,15 @@ except ImportError:
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 UI_STATE_FILE = os.path.join(NODE_DIR, "image_gallery_ui_state.json")
 CACHE_DIR = os.path.join(NODE_DIR, "thumbnail_cache")
+CACHE_DIR_PAD = os.path.join(NODE_DIR, "thumbnail_cache_pad")
 IMAGE_EXTENSIONS = frozenset(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'])
 CUSTOM_FOLDERS_FILE = os.path.join(NODE_DIR, "custom_source_folders.json")
 
 WEB_DIRECTORY = "./js"
 
-# Ensure cache directory exists
+# Ensure cache directories exist
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR_PAD, exist_ok=True)
 
 # Thread pool for background operations
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -267,6 +270,8 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
             all_images = sorted(all_images, key=lambda x: x['mtime'], reverse=True)
         elif sort_by == "date_asc":
             all_images = sorted(all_images, key=lambda x: x['mtime'])
+        elif sort_by == "random":
+            random.shuffle(all_images)
         else:
             all_images = sorted(all_images, key=lambda x: x['name'].lower())
         
@@ -312,6 +317,8 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
         all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0), reverse=True)
     elif sort_by == "date_asc":
         all_images = sorted(all_images, key=lambda x: mtimes.get(x, 0))
+    elif sort_by == "random":
+        random.shuffle(all_images)
     else:
         all_images = sorted(all_images, key=lambda x: x.lower())
     
@@ -327,21 +334,43 @@ def get_input_images_optimized(subfolder="", metadata_filter="all", sort_by="nam
     
     return image_list, all_folders, mtimes, input_dir
 
-def get_thumbnail_path(image_path):
-    """Get path to cached thumbnail."""
+def get_thumbnail_path(image_path, mode='crop'):
+    """Get path to cached thumbnail. mode is 'crop' or 'pad'."""
     # Create hash of path + mtime for cache key
     try:
         mtime = os.path.getmtime(image_path)
     except OSError:
         mtime = 0
     
-    cache_key = hashlib.md5(f"{image_path}:{mtime}".encode()).hexdigest()
-    return os.path.join(CACHE_DIR, f"{cache_key}.webp")
+    # v2 for pad: scale-to-fill-one-axis (allows upscaling); bump to invalidate old caches
+    key_src = f"{image_path}:{mtime}:padv2" if mode == 'pad' else f"{image_path}:{mtime}"
+    cache_key = hashlib.md5(key_src.encode()).hexdigest()
+    cache_dir = CACHE_DIR_PAD if mode == 'pad' else CACHE_DIR
+    return os.path.join(cache_dir, f"{cache_key}.webp")
 
 
-def generate_thumbnail(image_path, max_size=400):  # Doubled from 200
-    """Generate and cache a thumbnail."""
-    thumb_path = get_thumbnail_path(image_path)
+def _lanczos():
+    """LANCZOS filter compatible with older and newer Pillow."""
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return Image.LANCZOS
+
+
+def generate_thumbnail(image_path, max_size=400, mode='crop'):  # Doubled from 200
+    """Generate and cache a thumbnail.
+    
+    mode='crop': fit image inside max_size (aspect preserved, downscale only); CSS may crop via object-fit:cover.
+    mode='pad': scale (up or down) so image fills at least one axis of a max_size square, pad with #000000.
+    """
+    if mode not in ('crop', 'pad'):
+        mode = 'crop'
+    
+    # Ensure the target cache directory exists (in case it was deleted at runtime)
+    cache_dir = CACHE_DIR_PAD if mode == 'pad' else CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    thumb_path = get_thumbnail_path(image_path, mode)
     
     if os.path.exists(thumb_path):
         return thumb_path
@@ -349,22 +378,60 @@ def generate_thumbnail(image_path, max_size=400):  # Doubled from 200
     try:
         with Image.open(image_path) as img:
             img = ImageOps.exif_transpose(img)
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            resample = _lanczos()
             
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (30, 30, 30))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
+            if mode == 'pad':
+                # Convert to RGB on black background for transparency
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (0, 0, 0))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Scale (up or down) so the image always touches at least one pair of
+                # edges of the square. Equivalent to CSS object-fit: contain.
+                w, h = img.size
+                if w <= 0 or h <= 0:
+                    raise ValueError(f"Invalid image size {w}x{h}")
+                
+                scale = min(max_size / float(w), max_size / float(h))
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                # Clamp so we never exceed the canvas due to rounding
+                new_w = min(new_w, max_size)
+                new_h = min(new_h, max_size)
+                
+                if (new_w, new_h) != (w, h):
+                    img = img.resize((new_w, new_h), resample)
+                
+                # Pad to square with solid black #000000
+                canvas = Image.new('RGB', (max_size, max_size), (0, 0, 0))
+                offset = ((max_size - img.width) // 2, (max_size - img.height) // 2)
+                canvas.paste(img, offset)
+                img = canvas
+            else:
+                # Crop/fit mode: existing behavior (fit inside, dark gray bg for alpha)
+                img.thumbnail((max_size, max_size), resample)
+                
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (30, 30, 30))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
             
             # Quality 92, method 4 for good speed/quality balance
             img.save(thumb_path, 'WEBP', quality=92, method=4)
             return thumb_path
     except Exception as e:
-        print(f"Error generating thumbnail for {image_path}: {e}")
+        import traceback
+        print(f"Error generating thumbnail ({mode}) for {image_path}: {e}")
+        print(traceback.format_exc())
         return None
 
 def load_source_folders():
@@ -715,13 +782,14 @@ async def delete_image(request):
         if not os.path.isfile(image_path):
             return web.json_response({"error": "Path is not a file"}, status=400)
         
-        # Delete thumbnail cache first (before moving original)
-        thumb_path = get_thumbnail_path(image_path)
-        if os.path.exists(thumb_path):
-            try:
-                os.remove(thumb_path)  # Thumbnail can be permanently deleted
-            except:
-                pass
+        # Delete thumbnail caches first (before moving original) — both crop and pad
+        for mode in ('crop', 'pad'):
+            thumb_path = get_thumbnail_path(image_path, mode=mode)
+            if os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)  # Thumbnail can be permanently deleted
+                except:
+                    pass
         
         # Move to recycle bin or delete permanently
         if HAS_SEND2TRASH:
@@ -789,7 +857,7 @@ async def get_images_endpoint(request):
         if metadata_filter not in ['all', 'with', 'without']:
             metadata_filter = 'all'
         
-        if sort_by not in ['name', 'date', 'date_asc']:
+        if sort_by not in ['name', 'date', 'date_asc', 'random']:
             sort_by = 'name'
         
         if source_folder:
@@ -850,6 +918,9 @@ async def get_thumbnail(request):
     """Serve optimized thumbnails instead of full images."""
     filename = request.query.get('filename')
     source = request.query.get('source', '')
+    mode = request.query.get('mode', 'crop')
+    if mode not in ('crop', 'pad'):
+        mode = 'crop'
     
     if not filename:
         return web.Response(status=400, text="Missing filename parameter")
@@ -884,8 +955,8 @@ async def get_thumbnail(request):
         if not os.path.exists(image_path):
             return web.Response(status=404, text="Image not found")
         
-        # Generate or get cached thumbnail
-        thumb_path = generate_thumbnail(image_path)
+        # Generate or get cached thumbnail (crop or pad cache)
+        thumb_path = generate_thumbnail(image_path, mode=mode)
         
         if thumb_path and os.path.exists(thumb_path):
             return web.FileResponse(thumb_path, headers={
@@ -944,20 +1015,8 @@ async def get_preview_image(request):
 
 
 def cleanup_orphaned_thumbnails():
-    """Remove thumbnails for images that no longer exist."""
+    """Remove thumbnails for images that no longer exist (both crop and pad caches)."""
     try:
-        if not os.path.exists(CACHE_DIR):
-            return
-        
-        # Get all cached thumbnail files
-        cached_files = set()
-        for filename in os.listdir(CACHE_DIR):
-            if filename.endswith('.webp'):
-                cached_files.add(filename)
-        
-        if not cached_files:
-            return
-        
         # Get all valid source folders
         folders = load_source_folders()
         valid_dirs = [folder_paths.get_input_directory()]
@@ -990,15 +1049,27 @@ def cleanup_orphaned_thumbnails():
             except OSError:
                 continue
         
-        # Remove orphaned thumbnails
-        orphaned = cached_files - existing_hashes
         removed_count = 0
-        for orphaned_file in orphaned:
-            try:
-                os.remove(os.path.join(CACHE_DIR, orphaned_file))
-                removed_count += 1
-            except OSError:
-                pass
+        for cache_dir in (CACHE_DIR, CACHE_DIR_PAD):
+            if not os.path.exists(cache_dir):
+                continue
+            
+            cached_files = set()
+            for filename in os.listdir(cache_dir):
+                if filename.endswith('.webp'):
+                    cached_files.add(filename)
+            
+            if not cached_files:
+                continue
+            
+            # Remove orphaned thumbnails
+            orphaned = cached_files - existing_hashes
+            for orphaned_file in orphaned:
+                try:
+                    os.remove(os.path.join(cache_dir, orphaned_file))
+                    removed_count += 1
+                except OSError:
+                    pass
         
         if removed_count > 0:
             print(f"Cleaned up {removed_count} orphaned thumbnails")
