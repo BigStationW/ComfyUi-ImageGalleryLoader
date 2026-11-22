@@ -149,6 +149,7 @@ const LocalImageGalleryNode = {
                                 <option value="name">Name (A-Z)</option>
                                 <option value="date">Date (Newest)</option>
                                 <option value="date_asc">Date (Oldest)</option>
+                                <option value="random">Random</option>
                             </select>
                             <select class="fit-mode-select" title="Thumbnail fit mode">
                                 <option value="crop">Crop</option>
@@ -629,11 +630,14 @@ const LocalImageGalleryNode = {
                         ? img.name.split(/[/\\]/).pop() 
                         : img.name;
 
-                    // Append fit mode so the server serves crop vs pad cache
-                    let thumbSrc = img.preview_url || EMPTY_IMAGE;
-                    if (img.preview_url && state.fitMode) {
-                        const sep = img.preview_url.includes('?') ? '&' : '?';
-                        thumbSrc = `${img.preview_url}${sep}mode=${encodeURIComponent(state.fitMode)}`;
+                    // Always request the correct cache: crop vs pad
+                    const fitMode = (state.fitMode === 'pad') ? 'pad' : 'crop';
+                    let thumbSrc = EMPTY_IMAGE;
+                    if (img.preview_url) {
+                        // Strip any existing mode= param then append the current one
+                        const base = img.preview_url.replace(/([?&])mode=[^&]*/g, '$1').replace(/[?&]$/, '');
+                        const sep = base.includes('?') ? '&' : '?';
+                        thumbSrc = `${base}${sep}mode=${fitMode}`;
                     }
 
                     card.innerHTML = `
@@ -1456,9 +1460,14 @@ const LocalImageGalleryNode = {
                 .localimage-root .localimage-media-container img { 
                     width: 100%; height: 100%; object-fit: cover;
                 }
-                /* Pad mode: show full image (thumbnails are already letterboxed with black) */
+                /*
+                 * Pad mode: thumbnails are already letterboxed to a square with #000.
+                 * Use "fill" so the pre-padded square covers the cell (black bars are
+                 * part of the image). "contain" would add a second layer of padding
+                 * whenever the cell is not itself square.
+                 */
                 .localimage-root[data-fit-mode="pad"] .localimage-media-container img {
-                    object-fit: contain;
+                    object-fit: fill;
                 }
                 .localimage-root[data-fit-mode="crop"] .localimage-media-container img {
                     object-fit: cover;
